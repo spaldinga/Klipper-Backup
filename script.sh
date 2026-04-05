@@ -1,286 +1,300 @@
 #!/usr/bin/env bash
-
-# set dotglob so that bash treats hidden files/folders starting with . correctly when copying them (ex. .themes from mainsail)
+set -Eeuo pipefail
 shopt -s dotglob
 
-# Set parent directory path
-parent_path=$(
-    cd "$(dirname "${BASH_SOURCE[0]}")"
-    pwd -P
-)
+# ----------------------------
+# Helpers / logging
+# ----------------------------
+ts() { date +"%Y-%m-%d %H:%M:%S"; }
+log() { echo "[$(ts)] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
 
-# Initialize variables from .env file
-source "$parent_path"/.env
-source "$parent_path"/utils/utils.func
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-loading_wheel "${Y}●${NC} Checking for installed dependencies" &
-loading_pid=$!
-check_dependencies "jq" "curl" "rsync"
-kill $loading_pid
-echo -e "\r\033[K${G}●${NC} Checking for installed dependencies ${G}Done!${NC}\n"
+show_help() {
+  cat <<'EOF'
+Klipper backup -> git commit -> push (with origin sync before commit).
 
-# Do not touch these variables, the .env file and the documentation exist for this purpose
-backup_folder="config_backup"
-backup_path="$HOME/$backup_folder"
-allow_empty_commits=${allow_empty_commits:-true}
-use_filenames_as_commit_msg=${use_filenames_as_commit_msg:-false}
-git_protocol=${git_protocol:-"https"}
-git_host=${git_host:-"github.com"}
-ssh_user=${ssh_user:-"git"}
+Usage:
+  ./klipper_backup_sync.sh [options]
 
-if [[ $git_protocol == "ssh" ]]; then
-    full_git_url=$git_protocol"://"$ssh_user"@"$git_host"/"$github_username"/"$github_repository".git"
-else
-    full_git_url=$git_protocol"://"$github_token"@"$git_host"/"$github_username"/"$github_repository".git"
-fi
-exclude=${exclude:-"*.swp" "*.tmp" "printer-[0-9]*_[0-9]*.cfg" "*.bak" "*.bkp" "*.csv" "*.zip"}
+Options:
+  -h, --help                Show help
+  -c, --commit_message MSG  Use MSG as commit message
+  -d, --debug               Enable debug output
+  -f, --fix                 Placeholder for compatibility (no-op)
+EOF
+}
 
-# Required for checking the use of the commit_message and debug parameter
-commit_message_used=${commit_message_used:-false}
-debug_output=${debug_output:-false}
-# Collect args before they are consumed by getopts
-args="$@"
+# ----------------------------
+# Paths
+# ----------------------------
+parent_path="$(
+  cd "$(dirname "${BASH_SOURCE[0]}")"
+  pwd -P
+)"
 
-# Check parameters
+ENV_FILE="${ENV_FILE:-$parent_path/.env}"
+[[ -f "$ENV_FILE" ]] || die "Missing .env file at: $ENV_FILE"
+
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+# ----------------------------
+# Dependencies
+# ----------------------------
+require_cmd git
+require_cmd rsync
+require_cmd curl
+require_cmd jq
+
+# ----------------------------
+# Defaults (mirror Klipper-Backup style)
+# ----------------------------
+backup_folder="${backup_folder:-config_backup}"
+backup_path="${backup_path:-$HOME/$backup_folder}"
+
+allow_empty_commits="${allow_empty_commits:-true}"
+use_filenames_as_commit_msg="${use_filenames_as_commit_msg:-false}"
+
+git_protocol="${git_protocol:-https}"     # https or ssh
+git_host="${git_host:-github.com}"
+ssh_user="${ssh_user:-git}"
+
+branch_name="${branch_name:-main}"
+
+exclude=(${exclude:-"*.swp *.tmp printer-[0-9]*_[0-9]*.cfg *.bak *.bkp *.csv *.zip"})
+
+commit_message_used=false
+debug_output=false
+commit_message=""
+args="$*"
+
+# ----------------------------
+# Args
+# ----------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)
-      show_help
-      exit 0
-      ;;
-    -f|--fix)
-      fix
-      shift
-      ;;
+    -h|--help) show_help; exit 0 ;;
+    -f|--fix) shift ;; # kept for compatibility (no-op here)
     -c|--commit_message)
-      if  [[ -z "$2" || "$2" =~ ^- ]]; then
-          echo -e "\r\033[K${R}Error: commit message expected after $1${NC}" >&2
-          exit 1
-      else
-          commit_message="$2"
-          commit_message_used=true
-          shift 2
-      fi
+      [[ -n "${2:-}" && ! "${2:-}" =~ ^- ]] || die "commit message expected after $1"
+      commit_message="$2"
+      commit_message_used=true
+      shift 2
       ;;
     -d|--debug)
       debug_output=true
       shift
       ;;
-    *)
-      echo -e "\r\033[K${R}Unknown option: $1${NC}"
-      show_help
-      exit 1
-      ;;
+    *) die "Unknown option: $1" ;;
   esac
 done
 
-# Check for updates
-[ $(git -C "$parent_path" rev-parse HEAD) = $(git -C "$parent_path" ls-remote $(git -C "$parent_path" rev-parse --abbrev-ref @{u} | sed 's/\// /g') | cut -f1) ] && echo -e "Klipper-Backup is up to date\n" || echo -e "${Y}●${NC} Update for Klipper-Backup ${Y}Available!${NC}\n"
+# ----------------------------
+# Validate required env (v2 style)
+# ----------------------------
+: "${github_username:?Missing github_username in .env}"
+: "${github_repository:?Missing github_repository in .env}"
 
-# Check if .env is v1 version
-if [[ ! -v backupPaths ]]; then
-    echo ".env file is not using version 2 config, upgrading to V2"
-    if bash $parent_path/utils/v1convert.sh; then
-        echo "Upgrade complete restarting script.sh"
-        sleep 2.5
-        exec "$parent_path/script.sh" "$args"
-    fi
+# backupPaths must be an array in v2.
+# Example in .env:
+#   backupPaths=( "printer_data/config" "printer_data/database" )
+declare -p backupPaths >/dev/null 2>&1 || die ".env must define backupPaths as a bash array (v2 config)."
+
+# Identity defaults
+commit_username="${commit_username:-}"
+commit_email="${commit_email:-}"
+
+# Token is required for https
+github_token="${github_token:-}"
+
+# Build remote URL
+if [[ "$git_protocol" == "ssh" ]]; then
+  full_git_url="ssh://${ssh_user}@${git_host}/${github_username}/${github_repository}.git"
+else
+  [[ -n "$github_token" ]] || die "git_protocol=https requires github_token in .env"
+  full_git_url="https://${github_token}@${git_host}/${github_username}/${github_repository}.git"
 fi
 
-if [ "$debug_output" = true ]; then
-    # Debug output: Show last command
-    begin_debug_line
-    if [[ "$SHELL" == */bash* ]]; then
-        echo -e "Command: $0 $args"
-    fi
-    end_debug_line
-
-    # Debug output: .env file with hidden token
-    begin_debug_line
-    shopt -s nocaseglob
-    while IFS= read -r line; do
-        if [[ $line == github_token=* ]]; then
-            echo "github_token=**********"
-        elif [[ $line == commit_email=* ]]; then
-            echo "commit_email==**********"
-        else
-            echo "$line"
-        fi
-    done < $HOME/klipper-backup/.env
-    shopt -u nocasematch
-    end_debug_line
-
-    # Debug output: Check git repo
-    if [[ $git_host == "github.com" ]]; then
-        begin_debug_line
-        if curl -fsS "https://api.github.com/repos/${github_username}/${github_repository}" >/dev/null; then
-            echo "The GitHub repo ${github_username}/${github_repository} exists (public)"
-        else
-            echo "Error: no GitHub repo ${github_username}/${github_repository} found (maybe private)"
-        fi
-        end_debug_line
-    fi
+if [[ "$debug_output" == "true" ]]; then
+  log "Debug enabled"
+  log "Command: $0 $args"
+  log "parent_path: $parent_path"
+  log "backup_path: $backup_path"
+  log "remote host: $git_host"
+  log "remote repo: ${github_username}/${github_repository}"
+  log "branch_name: $branch_name"
 fi
 
-# Check if backup folder exists, create one if it does not
-if [ ! -d "$backup_path" ]; then
-    mkdir -p "$backup_path"
+# Quick check (public repo visibility check; not authoritative for private)
+if [[ "$debug_output" == "true" && "$git_host" == "github.com" ]]; then
+  if curl -fsS "https://api.github.com/repos/${github_username}/${github_repository}" >/dev/null; then
+    log "GitHub repo ${github_username}/${github_repository} exists (public or accessible)"
+  else
+    log "GitHub repo ${github_username}/${github_repository} not reachable via unauth API (might be private)"
+  fi
 fi
 
+# ----------------------------
+# Prepare backup directory & git repo
+# ----------------------------
+mkdir -p "$backup_path"
 cd "$backup_path"
 
-# Debug output: $HOME
-[ "$debug_output" = true ] && begin_debug_line && echo -e "\$HOME: $HOME" && end_debug_line
-
-# Debug output: $backup_path - (current) path and content
-[ "$debug_output" = true ] && begin_debug_line && echo -e "\$backup_path: $PWD" && echo -e "\nContent of \$backup_path:" && echo -ne "$(ls -la $backup_path)\n" && end_debug_line
-
-# Debug output: $backup_path/.git/config content
-if [ "$debug_output" = true ]; then
-    begin_debug_line
-    echo -e "\$backup_path/.git/config:\n"
-    while IFS= read -r line; do
-        if [[ $line == *"url ="*@* ]]; then
-            masked_line=$(echo "$line" | sed -E 's/(url = https:\/\/)[^@]*(@.*)/\1********\2/')
-            echo "$masked_line"
-        else
-            echo "$line"
-        fi
-    done < "$backup_path/.git/config"
-    end_debug_line
+if [[ ! -d .git ]]; then
+  mkdir -p .git
+  {
+    echo "[init]"
+    echo "  defaultBranch = ${branch_name}"
+  } >> .git/config
+  git init >/dev/null
 fi
 
-# Check if .git exists else init git repo
-if [ ! -d ".git" ]; then
-    mkdir .git
-    echo "[init]
-    defaultBranch = "$branch_name"" >>.git/config #Add desired branch name to config before init
-    git init
-# Check if the current checked out branch matches the branch name given in .env if not branch listed in .env
-elif [[ $(git symbolic-ref --short -q HEAD) != "$branch_name" ]]; then
-    echo -e "Branch: $branch_name in .env does not match the currently checked out branch of: $(git symbolic-ref --short -q HEAD)."
-    # Create branch if it does not exist
-    if git show-ref --quiet --verify "refs/heads/$branch_name"; then
-        git checkout "$branch_name" >/dev/null
-    else
-        git checkout -b "$branch_name" >/dev/null
-    fi
+# Ensure correct branch
+if [[ "$(git symbolic-ref --short -q HEAD || true)" != "$branch_name" ]]; then
+  if git show-ref --quiet --verify "refs/heads/$branch_name"; then
+    git checkout "$branch_name" >/dev/null
+  else
+    git checkout -b "$branch_name" >/dev/null
+  fi
 fi
 
-# Check if username is defined in .env
-if [[ "$commit_username" != "" ]]; then
-    git config user.name "$commit_username"
+# Configure identity
+if [[ -n "$commit_username" ]]; then
+  git config user.name "$commit_username"
 else
-    git config user.name "$(whoami)"
-    sed -i "s/^commit_username=.*/commit_username=\"$(whoami)\"/" "$parent_path"/.env
+  git config user.name "$(whoami)"
 fi
 
-# Check if email is defined in .env
-if [[ "$commit_email" != "" ]]; then
-    git config user.email "$commit_email"
+if [[ -n "$commit_email" ]]; then
+  git config user.email "$commit_email"
 else
-    unique_id=$(date +%s%N | md5sum | head -c 7)
-    user_email=$(whoami)@$(hostname --short)-$unique_id
-    git config user.email "$user_email"
-    sed -i "s/^commit_email=.*/commit_email=\"$user_email\"/" "$parent_path"/.env
+  unique_id="$(date +%s%N | md5sum | head -c 7)"
+  git config user.email "$(whoami)@$(hostname --short)-${unique_id}"
 fi
 
-# Check if remote origin already exists and create if one does not
-if [ -z "$(git remote get-url origin 2>/dev/null)" ]; then
-    git remote add origin "$full_git_url"
-fi
-
-# Check if remote origin changed and update when it is
-if [[ "$full_git_url" != $(git remote get-url origin) ]]; then
+# Set origin
+if ! git remote get-url origin >/dev/null 2>&1; then
+  git remote add origin "$full_git_url"
+else
+  if [[ "$(git remote get-url origin)" != "$full_git_url" ]]; then
     git remote set-url origin "$full_git_url"
+  fi
 fi
 
-# Check if branch exists on remote (newly created repos will not yet have a remote) and pull any new changes
-if git ls-remote --exit-code --heads origin $branch_name >/dev/null 2>&1; then
-    git pull origin "$branch_name"
-    # Delete the pulled files so that the directory is empty again before copying the new backup
-    # The pull is only needed so that the repository nows its on latest and does not require rebases or merges
-    find "$backup_path" -maxdepth 1 -mindepth 1 ! -name '.git' ! -name 'README.md' ! -name '.gitmodules' -exec rm -rf {} \;
+# ----------------------------
+# Sync from origin BEFORE copying new backup
+# (fail if non-fast-forward / conflicts)
+# ----------------------------
+git fetch origin "$branch_name" || die "Failed to fetch origin/$branch_name"
+
+if git ls-remote --exit-code --heads origin "$branch_name" >/dev/null 2>&1; then
+  # If remote exists, fast-forward only
+  git pull --ff-only origin "$branch_name" || die "Cannot fast-forward to origin/$branch_name (diverged/conflict). Aborting."
 fi
 
+# Clean working tree (keep .git and README.md if you like)
+find "$backup_path" -maxdepth 1 -mindepth 1 \
+  ! -name '.git' \
+  ! -name 'README.md' \
+  ! -name '.gitmodules' \
+  -exec rm -rf {} \;
+
+# ----------------------------
+# Copy backupPaths into repo (ignore symlinks)
+# ----------------------------
 cd "$HOME"
-# Iterate through backupPaths array and copy files to the backup folder while ignoring symbolic links
+
 for path in "${backupPaths[@]}"; do
-    fullPath="$HOME/$path"
-    if [[ -d "$fullPath" && ! -f "$fullPath" ]]; then
-        # Check if the directory path ends with only a '/'
-        if [[ "$path" =~ /$ ]]; then
-            # If it ends with '/', replace it with '/*'
-            backupPaths[$i]="$path*"
-        elif [[ -d "$path" ]]; then
-            # If it's a directory without '/', add '/*' at the end
-            backupPaths[$i]="$path/*"
-        fi
+  fullPath="$HOME/$path"
+
+  # Expand directories into contents
+  if [[ -d "$fullPath" ]]; then
+    # If user gave "dir", treat as "dir/*"
+    if [[ "$path" != */* && -d "$HOME/$path" ]]; then
+      path="$path/*"
+    elif [[ "$path" != */* && -d "$path" ]]; then
+      path="$path/*"
     fi
+  fi
 
-    if compgen -G "$fullPath" >/dev/null; then
-        # Iterate over every file in the path
-        for file in $path; do
-            # Skip if file is symbolic link
-            if [ -h "$file" ]; then
-                echo "Skipping symbolic link: $file"
-            else
-                file=$(readlink -e "$file") # Get absolute path before copy (Allows usage of .. in filepath eg. ../../etc/fstab resovles to /etc/fstab )
-                rsync -Rr  --filter "- /.git/" --filter "- /.github/" "${file##"$HOME"/}" "$backup_path"
-            fi
-        done
-    fi
+  if compgen -G "$HOME/$path" >/dev/null; then
+    for file in $path; do
+      if [[ -h "$file" ]]; then
+        log "Skipping symlink: $file"
+        continue
+      fi
+      abs="$(readlink -e "$file")" || continue
+      rsync -Rr --filter "- /.git/" --filter "- /.github/" "${abs##"$HOME"/}" "$backup_path"
+    done
+  else
+    log "Path did not match anything, skipping: $path"
+  fi
 done
-
-# Debug output: $backup_path content after running rsync
-[ "$debug_output" = true ] && begin_debug_line && echo -e "Content of \$backup_path after rsync:" && echo -ne "$(ls -la $backup_path)\n" && end_debug_line
-
-cp "$parent_path"/.gitignore "$backup_path/.gitignore"
-
-# utilize gits native exclusion file .gitignore to add files that should not be uploaded to remote.
-# Loop through exclude array and add each element to the end of .gitignore
-for i in ${exclude[@]}; do
-    # add new line to end of .gitignore if there is not one
-    [[ $(tail -c1 "$backup_path/.gitignore" | wc -l) -eq 0 ]] && echo "" >>"$backup_path/.gitignore"
-    echo $i >>"$backup_path/.gitignore"
-done
-
-# Individual commit message, if no parameter is set, use the current timestamp as commit message
-if ! $commit_message_used; then
-    commit_message="New backup from $(date +"%x - %X")"
-fi
 
 cd "$backup_path"
-# Create and add Readme to backup folder if it doesn't already exist
-if ! [ -f "README.md" ]; then
-    echo -e "# Klipper-Backup 💾 \nKlipper backup script for manual or automated GitHub backups \n\nThis backup is provided by [Klipper-Backup](https://github.com/Staubgeborener/Klipper-Backup)." >"$backup_path/README.md"
+
+# Ensure .gitignore exists
+touch .gitignore
+
+# Append excludes
+for pat in "${exclude[@]}"; do
+  # add newline if needed
+  [[ -n "$(tail -c1 .gitignore 2>/dev/null || true)" ]] && echo >> .gitignore
+  echo "$pat" >> .gitignore
+done
+
+# Ensure README exists
+if [[ ! -f README.md ]]; then
+  cat > README.md <<'EOF'
+# Klipper Backup
+
+This repository is a backup of Klipper/Moonraker/Mainsail printer configuration and related files.
+EOF
 fi
 
-# Show in commit message which files have been changed
-if $use_filenames_as_commit_msg; then
-    commit_message=$(git diff --name-only "$branch_name" | xargs -n 1 basename | tr '\n' ' ')
+# ----------------------------
+# Commit message
+# ----------------------------
+if [[ "$commit_message_used" != "true" ]]; then
+  commit_message="New backup from $(date +"%x - %X")"
 fi
 
-# Untrack all files so that any new excluded files are correctly ignored and deleted from remote
-git rm -r --cached . >/dev/null 2>&1
-git add .
-
-if [[ -n "$ai_describe_commit_command" ]]; then
-    described_commit=$(${ai_describe_commit_command})
-    ret=$?
-    if [[ $ret -ne 0 ]]; then
-        printf "\r\033[K${R}Error: describe-commit command failed with exit code %d. Falling back to default commit message.${NC}\n" $ret
-    elif [[ -n "$described_commit" ]]; then
-        commit_message="$described_commit"
-    fi
+if [[ "$use_filenames_as_commit_msg" == "true" ]]; then
+  # Only meaningful if repo already had content
+  # Use staged diff vs branch tip
+  files="$(git diff --name-only "$branch_name" || true)"
+  if [[ -n "$files" ]]; then
+    commit_message="$(echo "$files" | xargs -n 1 basename | tr '\n' ' ')"
+  fi
 fi
 
-git commit -m "$commit_message"
-# Check if HEAD still matches remote (Means there are no updates to push) and create a empty commit just informing that there are no new updates to push
-if $allow_empty_commits && [[ $(git rev-parse HEAD) == $(git ls-remote $(git rev-parse --abbrev-ref @{u} 2>/dev/null | sed 's/\// /g') | cut -f1) ]]; then
-    git commit --allow-empty -m "$commit_message - No new changes pushed"
+# Untrack all so that ignore changes apply (optional; mirrors original idea)
+git rm -r --cached . >/dev/null 2>&1 || true
+
+git add -A
+
+# Don’t fail if nothing changed; allow empty commit if enabled
+if git diff --cached --quiet; then
+  log "No changes to commit."
+  if [[ "$allow_empty_commits" == "true" ]]; then
+    git commit --allow-empty -m "$commit_message - No new changes pushed" >/dev/null
+  else
+    log "Empty commits disabled; exiting without push."
+    exit 0
+  fi
+else
+  git commit -m "$commit_message" >/dev/null
 fi
+
 git push -u origin "$branch_name"
 
-# Remove files except .git folder after backup so that any file deletions can be logged on next backup
-find "$backup_path" -maxdepth 1 -mindepth 1 ! -name '.git' ! -name 'README.md' ! -name '.gitmodules' -exec rm -rf {} \;
+# Optional cleanup after push
+find "$backup_path" -maxdepth 1 -mindepth 1 \
+  ! -name '.git' \
+  ! -name 'README.md' \
+  ! -name '.gitmodules' \
+  -exec rm -rf {} \;
+
+log "Backup complete."
